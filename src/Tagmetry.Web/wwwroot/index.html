@@ -1,0 +1,128 @@
+﻿<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tagmetry</title>
+
+  <!-- Pico CSS (MIT) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+
+  <style>
+    :root { --pico-border-radius: 14px; }
+    body {
+      background:
+        radial-gradient(1200px 600px at 20% 0%, rgba(99,102,241,.18), transparent 60%),
+        radial-gradient(900px 500px at 90% 10%, rgba(16,185,129,.14), transparent 55%),
+        var(--pico-background-color);
+    }
+    header.hero { padding-top: 2.2rem; padding-bottom: 1rem; }
+    .brand { display:flex; align-items:center; gap:.75rem; }
+    .dot {
+      width: 12px; height: 12px; border-radius: 999px;
+      background: linear-gradient(135deg, rgba(99,102,241,.95), rgba(16,185,129,.95));
+      box-shadow: 0 0 18px rgba(99,102,241,.35);
+    }
+    .subtle { color: var(--pico-muted-color); }
+    pre#log {
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--pico-muted-border-color);
+      background: rgba(0,0,0,.22);
+    }
+    #status {
+      margin-top: .5rem;
+      padding: .75rem 1rem;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 12px;
+      background: rgba(255,255,255,.04);
+      min-height: 2.5rem;
+    }
+    .row { display:flex; gap:.75rem; flex-wrap:wrap; align-items:end; }
+    .row > * { flex: 1 1 280px; }
+    .btn-row { display:flex; gap:.6rem; justify-content:flex-end; flex: 0 0 auto; }
+    .btn-row button { width: auto; }
+    footer { padding: 1.5rem 0 2.5rem; }
+  </style>
+</head>
+
+<body>
+  <main class="container">
+    <header class="hero">
+      <div class="brand">
+        <span class="dot" aria-hidden="true"></span>
+        <div>
+          <hgroup style="margin-bottom:.25rem">
+            <h1 style="margin-bottom:.15rem">Tagmetry</h1>
+            <p class="subtle" style="margin:0">Local runner UI for tagging / caption pipelines</p>
+          </hgroup>
+        </div>
+      </div>
+
+      <nav style="margin-top:1rem">
+        <ul>
+          <li class="subtle">Status: <strong id="statusInline">Idle</strong></li>
+        </ul>
+        <ul>
+          <li><button id="themeBtn" class="secondary" type="button">Toggle theme</button></li>
+        </ul>
+      </nav>
+    </header>
+
+    <article>
+      <header>
+        <h2 style="margin-bottom:.25rem">Run</h2>
+        <p class="subtle" style="margin:0">Choose an input directory and start processing.</p>
+      </header>
+
+      <div class="row">
+        <label>
+          Input directory
+          <input id="inputDir" placeholder="D:\ai\kohya_ss\dataset\images\..." />
+          <small class="subtle">Windows path supported. Keep the server running in the background.</small>
+        </label>
+
+        <div class="btn-row">
+          <button id="runBtn" type="button">Run</button>
+        </div>
+      </div>
+
+      <div id="status" role="status" aria-live="polite"></div>
+
+      <h3 style="margin-top:1.25rem">Log (tail)</h3>
+      <pre id="log"></pre>
+    </article>
+
+    <footer class="subtle">
+      <small>Tip: If you ship this UI, bundle Pico locally and keep the MIT license file in your distribution.</small>
+    </footer>
+  </main>
+
+  <script>
+    // Small theme toggle (optional)
+    const html = document.documentElement;
+    const btn = document.getElementById("themeBtn");
+    const key = "tagmetry.theme";
+    const saved = localStorage.getItem(key);
+    if (saved) html.setAttribute("data-theme", saved);
+    btn?.addEventListener("click", () => {
+      const next = html.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      html.setAttribute("data-theme", next);
+      localStorage.setItem(key, next);
+    });
+
+    // Mirror status text into header (optional, app.js still writes #status)
+    const statusEl = document.getElementById("status");
+    const statusInline = document.getElementById("statusInline");
+    const obs = new MutationObserver(() => {
+      const t = (statusEl?.textContent || "Idle").trim() || "Idle";
+      if (statusInline) statusInline.textContent = t;
+    });
+    if (statusEl) obs.observe(statusEl, { childList: true, subtree: true, characterData: true });
+  </script>
+
+  <script src="app.js"></script>
+</body>
+</html>
