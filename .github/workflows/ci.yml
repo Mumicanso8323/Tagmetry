@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore
+        run: dotnet restore Tagmetry.sln
+
+      - name: Build
+        run: dotnet build Tagmetry.sln -c Release --no-restore
+
+      - name: Validate third-party notices
+        run: python scripts/check_third_party_notices.py
+
+      - name: Test
+        run: dotnet test Tagmetry.sln -c Release --no-build

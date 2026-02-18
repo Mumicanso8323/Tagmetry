@@ -1,0 +1,6 @@
+Component: SixLabors.ImageSharp
+Version: 3.1.6
+Source: NuGet
+License: License file: LICENSE
+License URL: https://aka.ms/deprecateLicenseUrl
+Homepage: https://github.com/SixLabors/ImageSharp

@@ -132,16 +132,22 @@
 
       <div class="controls">
         <button id="runBtn" type="button">Run</button>
-
-        <label>
-          <input id="liveLogToggle" type="checkbox">
-          Live log
-        </label>
+        <button id="cancelBtn" type="button" class="secondary">Cancel</button>
       </div>
     </section>
 
     <section class="card">
-      <h2>Log</h2>
+      <h2>Privacy & Telemetry</h2>
+      <p class="hint">All analysis runs on this device. Telemetry is optional and disabled by default.</p>
+      <label>
+        <input id="telemetryToggle" type="checkbox">
+        Enable telemetry (opt-in)
+      </label>
+      <p id="telemetryState" class="hint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Job logs (sanitized)</h2>
       <pre id="log"></pre>
     </section>
   </main>
