@@ -75,6 +75,7 @@ if errorlevel 1 (
 
 if /i "%MODE%"=="debug"   goto :debug
 if /i "%MODE%"=="publish" goto :publish
+if /i "%MODE%"=="notices" goto :notices
 
 echo [ERROR] Unknown mode: "%MODE%"
 >>"%LOGFILE%" echo [ERROR] Unknown mode: "%MODE%"
@@ -93,6 +94,7 @@ goto :ok
 call :must dotnet --version
 call :must dotnet restore "%ROOT%Tagmetry.sln"
 call :must dotnet build "%ROOT%Tagmetry.sln" -c Release
+call :must python "%ROOT%scripts\generate_third_party_notices.py"
 
 set "OUTDIR=%ROOT%dist\web"
 if exist "%OUTDIR%" rmdir /s /q "%OUTDIR%" >nul 2>&1
@@ -111,6 +113,11 @@ echo [INFO] Published to: "%OUTDIR%"
 >>"%LOGFILE%" echo [INFO] Published to: "%OUTDIR%"
 goto :ok
 
+
+
+:notices
+call :must python "%ROOT%scripts\generate_third_party_notices.py"
+goto :ok
 
 :must
 call :run %*
@@ -160,6 +167,7 @@ exit /b 0
 echo Usage:
 echo   tool.bat debug
 echo   tool.bat publish
+echo   tool.bat notices
 echo.
 echo Options:
 echo   --nopause   : do not pause at end in interactive mode

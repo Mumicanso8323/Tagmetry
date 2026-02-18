@@ -1,0 +1,6 @@
+Component: YamlDotNet
+Version: 16.2.1
+Source: NuGet
+License: SPDX: MIT
+License URL: https://licenses.nuget.org/MIT
+Homepage: https://github.com/aaubry/YamlDotNet/wiki

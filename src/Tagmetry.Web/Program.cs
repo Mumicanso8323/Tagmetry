@@ -1,284 +1,306 @@
+using Microsoft.Extensions.Options;
 using Tagmetry.Adapters.JoyTag;
 using Tagmetry.Adapters.Logging;
-using Microsoft.Extensions.Options;
-using Microsoft.Extensions.Logging;
+using Tagmetry.Core.Jobs;
 
 var baseDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
-// exe の隣に log\ を作り、最初から必ず書けるようにする
-var bootstrapLogDir = Path.Combine(baseDir, "log");
-Directory.CreateDirectory(bootstrapLogDir);
-var bootstrapLogPath = Path.Combine(bootstrapLogDir, "bootstrap.log");
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions {
+    Args = args,
+    ContentRootPath = baseDir
+});
 
-void BootstrapLog(string message, Exception? ex = null)
-{
-    try
-    {
-        var line = $"{DateTimeOffset.Now:O} {message}";
-        if (ex is not null) line += Environment.NewLine + ex;
-        File.AppendAllText(bootstrapLogPath, line + Environment.NewLine);
-    }
-    catch
-    {
-        // 絶対にここで例外を投げない
-    }
-}
+builder.Configuration.SetBasePath(baseDir);
+builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: false);
+builder.Configuration.AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true, reloadOnChange: false);
 
-// できるだけ早い段階で「落ちた理由」を捕まえる
-AppDomain.CurrentDomain.UnhandledException += (_, e) =>
-{
-    BootstrapLog($"[FATAL] UnhandledException (IsTerminating={e.IsTerminating})",
-        e.ExceptionObject as Exception);
-};
+builder.Services.Configure<JoyTagOptions>(builder.Configuration.GetSection("JoyTag"));
+builder.Services.AddSingleton<JoyTagProcessController>();
+builder.Services.AddSingleton<JobRunnerStub>();
+builder.Services.AddSingleton<JobStore>();
+builder.Services.AddSingleton(new TelemetrySettingsStore(builder.Configuration.GetValue<bool?>("Telemetry:Enabled") ?? false));
 
-TaskScheduler.UnobservedTaskException += (_, e) =>
-{
-    BootstrapLog("[ERROR] UnobservedTaskException", e.Exception);
-    e.SetObserved();
-};
+var repoRoot = FindRepoRoot(baseDir) ?? baseDir;
+var logsDirName = builder.Configuration["Paths:LogsDir"];
+if (string.IsNullOrWhiteSpace(logsDirName)) logsDirName = "log";
+var logDir = Path.GetFullPath(Path.Combine(repoRoot, logsDirName));
+Directory.CreateDirectory(logDir);
 
-try
-{
-    BootstrapLog($"Starting Tagmetry.Web (BaseDir={baseDir})");
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(o => o.TimestampFormat = "HH:mm:ss ");
+builder.Logging.AddJsonConsole();
+builder.Logging.AddProvider(new FileLoggerProvider(Path.Combine(logDir, "web.log")));
 
-    // ContentRoot を exe のある場所に寄せる（publish / 単体exe実行でのパス事故を減らす）
-    var builder = WebApplication.CreateBuilder(new WebApplicationOptions
-    {
-        Args = args,
-        ContentRootPath = baseDir
+var app = builder.Build();
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
+app.MapGet("/health", (ILoggerFactory lf, TelemetrySettingsStore telemetry) => {
+    var logger = lf.CreateLogger("Health");
+    logger.LogInformation("Health probe OK.");
+    return Results.Ok(new {
+        ok = true,
+        service = "Tagmetry.Web",
+        telemetryEnabled = telemetry.IsEnabled,
+        time = DateTimeOffset.UtcNow
     });
+});
 
-    // -----------------------------
-    // Configuration:
-    // appsettings が無くても起動する（optional:true）
-    // -----------------------------
-    try
-    {
-        // baseDir を基準に appsettings を探す
-        builder.Configuration.SetBasePath(baseDir);
+app.MapGet("/settings", (TelemetrySettingsStore telemetry) => Results.Ok(new {
+    telemetryEnabled = telemetry.IsEnabled,
+    telemetryMode = "opt-in"
+}));
 
-        var envName = builder.Environment.EnvironmentName;
+app.MapPost("/settings/telemetry", (TelemetryUpdateRequest request, TelemetrySettingsStore telemetry, ILoggerFactory lf) => {
+    telemetry.Set(request.Enabled);
+    lf.CreateLogger("Settings").LogInformation("Telemetry preference updated. Enabled={Enabled}", request.Enabled);
+    return Results.Ok(new { telemetryEnabled = telemetry.IsEnabled });
+});
 
-        // ★重要：optional:true（無くても落ちない）
-        builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: false);
-        builder.Configuration.AddJsonFile($"appsettings.{envName}.json", optional: true, reloadOnChange: false);
+app.MapPost("/jobs", async (AnalysisJobRequest request, JobStore store, JobRunnerStub runner, ILoggerFactory lf, CancellationToken ct) => {
+    var logger = lf.CreateLogger("Jobs");
+    var jobId = store.Create(request);
 
-        BootstrapLog($"Config loaded (optional). EnvironmentName={envName}");
-    }
-    catch (Exception ex)
-    {
-        // config 周りで落ちても bootstrap に残す
-        BootstrapLog("[WARN] Configuration load failed (continuing with defaults).", ex);
-    }
+    logger.LogInformation("Job created. JobId={JobId}", jobId);
 
-    // -----------------------------
-    // Services / Options
-    // -----------------------------
-    builder.Services.Configure<JoyTagOptions>(builder.Configuration.GetSection("JoyTag"));
-    builder.Services.AddSingleton<JoyTagProcessController>();
-    builder.Services.AddSingleton<JobStore>();
+    _ = Task.Run(async () => {
+        using var scope = logger.BeginScope(new Dictionary<string, object?> { ["jobId"] = jobId });
 
-    // -----------------------------
-    // Logging
-    // -----------------------------
-    // repo root（開発時は sln を辿る / publish は baseDir に落ちる）
-    var repoRoot = FindRepoRoot(baseDir) ?? baseDir;
+        try {
+            store.MarkRunning(jobId, "queued", "Job accepted and queued.");
+            store.AddLog(jobId, "Information", "Job queued.", new Dictionary<string, object?> {
+                ["jobId"] = jobId
+            });
 
-    var logsDirName = builder.Configuration["Paths:LogsDir"];
-    if (string.IsNullOrWhiteSpace(logsDirName)) logsDirName = "log";
+            var result = await runner.RunAsync(
+                jobId,
+                request,
+                store.CreateProgressSink(jobId),
+                logger,
+                store.GetToken(jobId));
 
-    var logDir = Path.GetFullPath(Path.Combine(repoRoot, logsDirName));
-    Directory.CreateDirectory(logDir);
-
-    // bootstrap も最終 logDir に寄せる（分散しないように）
-    try
-    {
-        if (!Path.GetFullPath(bootstrapLogDir).Equals(logDir, StringComparison.OrdinalIgnoreCase))
-        {
-            bootstrapLogDir = logDir;
-            bootstrapLogPath = Path.Combine(bootstrapLogDir, "bootstrap.log");
-            Directory.CreateDirectory(bootstrapLogDir);
-            BootstrapLog($"Bootstrap log relocated to: {bootstrapLogPath}");
+            store.Complete(jobId, result);
+            store.AddLog(jobId, "Information", "Job completed.", new Dictionary<string, object?> {
+                ["state"] = result.State.ToString()
+            });
         }
+        catch (OperationCanceledException) {
+            store.Cancel(jobId, "Cancellation requested.");
+            store.AddLog(jobId, "Warning", "Job canceled.", new Dictionary<string, object?>());
+            logger.LogWarning("Job canceled.");
+        }
+        catch (Exception ex) {
+            store.Fail(jobId, ex.GetType().Name);
+            store.AddLog(jobId, "Error", "Job failed.", new Dictionary<string, object?> {
+                ["errorType"] = ex.GetType().Name
+            });
+            logger.LogError(ex, "Job failed.");
+        }
+    }, ct);
+
+    return Results.Accepted($"/jobs/{jobId}", new { jobId });
+});
+
+app.MapGet("/jobs/{id:guid}", (Guid id, JobStore store) => {
+    var status = store.GetStatus(id);
+    return status is null ? Results.NotFound() : Results.Ok(status);
+});
+
+app.MapPost("/jobs/{id:guid}/cancel", (Guid id, JobStore store, ILoggerFactory lf) => {
+    var logger = lf.CreateLogger("Jobs");
+    var canceled = store.RequestCancel(id);
+    if (!canceled) {
+        return Results.NotFound(new { message = "Job not found or cannot be canceled." });
     }
-    catch { /* ignore */ }
 
-    builder.Logging.ClearProviders();
-    builder.Logging.AddSimpleConsole(o => { o.TimestampFormat = "HH:mm:ss "; });
-    builder.Logging.AddProvider(new FileLoggerProvider(Path.Combine(logDir, "web.log")));
+    logger.LogInformation("Cancel requested. JobId={JobId}", id);
+    return Results.Ok(new { jobId = id, canceled = true });
+});
 
-    var app = builder.Build();
+app.MapGet("/jobs/{id:guid}/logs", (Guid id, JobStore store) => {
+    var logs = store.GetLogs(id);
+    return logs is null ? Results.NotFound() : Results.Ok(new { jobId = id, logs });
+});
 
-    // DI 後ログ
-    var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
-    startupLogger.LogInformation("Application starting. BaseDir={BaseDir} RepoRoot={RepoRoot} LogDir={LogDir}",
-        baseDir, repoRoot, logDir);
+app.MapGet("/jobs/{id:guid}/result", (Guid id, JobStore store) => {
+    var result = store.GetResult(id);
+    return result is null ? Results.NotFound() : Results.Ok(result);
+});
 
-    // listen url
-    var listenUrl = builder.Configuration["Web:ListenUrl"];
-    if (string.IsNullOrWhiteSpace(listenUrl)) listenUrl = "http://127.0.0.1:5099";
-    app.Urls.Clear();
-    app.Urls.Add(listenUrl);
+app.Run();
 
-    // static files
-    app.UseDefaultFiles();
-    app.UseStaticFiles();
-
-    // endpoints
-    app.MapPost("/api/run", (RunRequest req, JobStore store, JoyTagProcessController joytag,
-        IOptions<JoyTagOptions> joyOpt, ILoggerFactory lf, CancellationToken ct) =>
-    {
-        var jobId = store.Start(req);
-
-        _ = Task.Run(async () =>
-        {
-            var logger = lf.CreateLogger("JobRunner");
-            try
-            {
-                var thirdPartyDirName = builder.Configuration["Paths:ThirdPartyDir"];
-                if (string.IsNullOrWhiteSpace(thirdPartyDirName)) thirdPartyDirName = "third_party";
-
-                var thirdPartyDir = Path.GetFullPath(Path.Combine(repoRoot, thirdPartyDirName));
-
-                if (!Directory.Exists(thirdPartyDir))
-                {
-                    // ここは「落とさず」ログに出して job を fail にする
-                    var msg = $"third_party not found: {thirdPartyDir}";
-                    store.Fail(jobId, msg);
-                    logger.LogError(msg);
-                    BootstrapLog("[ERROR] " + msg);
-                    return;
-                }
-
-                await joytag.StartAsync(thirdPartyDir, joyOpt.Value, CancellationToken.None);
-
-                for (int p = 0; p <= 100; p += 10)
-                {
-                    store.Update(jobId, p, $"Processing... {p}%");
-                    await Task.Delay(300, ct);
-                }
-
-                store.Complete(jobId, new { ok = true, input = req.InputDir });
-                logger.LogInformation("Job completed: {JobId}", jobId);
-            }
-            catch (OperationCanceledException oce)
-            {
-                store.Fail(jobId, "Canceled");
-                logger.LogWarning(oce, "Job canceled: {JobId}", jobId);
-            }
-            catch (Exception ex)
-            {
-                store.Fail(jobId, ex.Message);
-                logger.LogError(ex, "Job failed: {JobId}", jobId);
-                BootstrapLog($"[ERROR] Background job failed: {jobId}", ex);
-            }
-            finally
-            {
-                try { await joytag.StopAsync(); }
-                catch (Exception ex) { BootstrapLog("[WARN] joytag.StopAsync failed", ex); }
-            }
-        }, ct);
-
-        return Results.Ok(new { jobId });
-    });
-
-    app.MapGet("/api/status", (Guid jobId, JobStore store) =>
-    {
-        var s = store.Get(jobId);
-        return s is null ? Results.NotFound() : Results.Ok(s);
-    });
-
-    app.MapGet("/api/log", (int lines) =>
-    {
-        lines = Math.Clamp(lines, 50, 2000);
-        var path = Path.Combine(logDir, "web.log");
-        if (!File.Exists(path)) return Results.Ok(new { lines = Array.Empty<string>() });
-
-        var tail = TailLines(path, lines);
-        return Results.Ok(new { lines = tail });
-    });
-
-    app.MapGet("/api/report", (Guid jobId, JobStore store) =>
-    {
-        var r = store.GetReport(jobId);
-        return r is null ? Results.NotFound() : Results.Ok(r);
-    });
-
-    app.MapGet("/api/ping", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
-
-    app.Lifetime.ApplicationStopping.Register(() => startupLogger.LogInformation("Application stopping..."));
-    app.Lifetime.ApplicationStopped.Register(() => startupLogger.LogInformation("Application stopped."));
-
-    app.Run();
-}
-catch (Exception ex)
-{
-    // 絶対に痕跡を残す
-    BootstrapLog("[FATAL] Process crashed.", ex);
-    try
-    {
-        var crashPath = Path.Combine(bootstrapLogDir, $"crash_{DateTimeOffset.Now:yyyyMMdd_HHmmss}.log");
-        File.WriteAllText(crashPath, ex.ToString());
-    }
-    catch { }
-    throw;
-}
-
-static string? FindRepoRoot(string start)
-{
+static string? FindRepoRoot(string start) {
     var dir = new DirectoryInfo(start);
-    while (dir != null)
-    {
+    while (dir != null) {
         if (File.Exists(Path.Combine(dir.FullName, "Tagmetry.sln"))) return dir.FullName;
         dir = dir.Parent;
     }
+
     return null;
 }
 
-static string[] TailLines(string filePath, int lines)
-{
-    var all = File.ReadAllLines(filePath);
-    return all.Skip(Math.Max(0, all.Length - lines)).ToArray();
+internal sealed record TelemetryUpdateRequest(bool Enabled);
+
+internal sealed class TelemetrySettingsStore(bool enabled) {
+    private volatile bool _enabled = enabled;
+    public bool IsEnabled => _enabled;
+    public void Set(bool enabled) => _enabled = enabled;
 }
 
-record RunRequest(string InputDir);
-
-sealed class JobStore
-{
+internal sealed class JobStore {
     private readonly object _gate = new();
-    private readonly Dictionary<Guid, object> _status = new();
-    private readonly Dictionary<Guid, object> _report = new();
+    private readonly Dictionary<Guid, JobEntry> _jobs = new();
 
-    public Guid Start(RunRequest req)
-    {
+    public Guid Create(AnalysisJobRequest request) {
         var id = Guid.NewGuid();
-        lock (_gate) _status[id] = new { jobId = id, state = "running", percent = 0, message = "started", input = req.InputDir };
+        var now = DateTimeOffset.UtcNow;
+
+        lock (_gate) {
+            _jobs[id] = new JobEntry(
+                request,
+                new CancellationTokenSource(),
+                new AnalysisJobStatus(id, JobState.Queued, 0, "queued", "Created", now, now, null, true));
+        }
+
         return id;
     }
 
-    public void Update(Guid id, int percent, string message)
-    {
-        lock (_gate)
-        {
-            if (_status.ContainsKey(id))
-                _status[id] = new { jobId = id, state = "running", percent, message };
+    public void MarkRunning(Guid id, string stage, string message) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return;
+            entry.Status = entry.Status with {
+                State = JobState.Running,
+                Stage = stage,
+                Message = message,
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                IsCancelable = true
+            };
         }
     }
 
-    public void Complete(Guid id, object report)
-    {
-        lock (_gate)
-        {
-            _status[id] = new { jobId = id, state = "completed", percent = 100, message = "done" };
-            _report[id] = report;
+    public IJobProgressSink CreateProgressSink(Guid id) => new ProgressSink(update => {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return;
+
+            entry.Status = entry.Status with {
+                State = JobState.Running,
+                Percent = Math.Clamp(update.Percent, 0, 100),
+                Stage = update.Stage,
+                Message = update.Message,
+                UpdatedAtUtc = update.AtUtc,
+                IsCancelable = true
+            };
+
+            entry.Logs.Add(new JobLogEntry(update.AtUtc, "Information", update.Message, new Dictionary<string, object?> {
+                ["stage"] = update.Stage,
+                ["percent"] = update.Percent
+            }));
+        }
+    });
+
+    public CancellationToken GetToken(Guid id) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) throw new KeyNotFoundException("Job not found.");
+            return entry.Cancellation.Token;
         }
     }
 
-    public void Fail(Guid id, string error)
-    {
-        lock (_gate) _status[id] = new { jobId = id, state = "failed", percent = 0, message = error };
+    public bool RequestCancel(Guid id) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return false;
+            if (entry.Status.State is JobState.Completed or JobState.Failed or JobState.Canceled) return false;
+            entry.Cancellation.Cancel();
+            return true;
+        }
     }
 
-    public object? Get(Guid id) { lock (_gate) return _status.TryGetValue(id, out var s) ? s : null; }
-    public object? GetReport(Guid id) { lock (_gate) return _report.TryGetValue(id, out var r) ? r : null; }
+    public void Cancel(Guid id, string message) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return;
+            var now = DateTimeOffset.UtcNow;
+            entry.Status = entry.Status with {
+                State = JobState.Canceled,
+                Message = message,
+                UpdatedAtUtc = now,
+                FinishedAtUtc = now,
+                IsCancelable = false
+            };
+            entry.Result = new AnalysisJobResult(id, JobState.Canceled, new Dictionary<string, object?>(), message, now);
+        }
+    }
+
+    public void Complete(Guid id, AnalysisJobResult result) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return;
+            var now = DateTimeOffset.UtcNow;
+            entry.Status = entry.Status with {
+                State = JobState.Completed,
+                Percent = 100,
+                Stage = "completed",
+                Message = "Completed",
+                UpdatedAtUtc = now,
+                FinishedAtUtc = now,
+                IsCancelable = false
+            };
+            entry.Result = result with { FinishedAtUtc = now };
+        }
+    }
+
+    public void Fail(Guid id, string error) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return;
+            var now = DateTimeOffset.UtcNow;
+            entry.Status = entry.Status with {
+                State = JobState.Failed,
+                Stage = "failed",
+                Message = "Job failed. See logs for details.",
+                UpdatedAtUtc = now,
+                FinishedAtUtc = now,
+                IsCancelable = false
+            };
+            entry.Result = new AnalysisJobResult(id, JobState.Failed, new Dictionary<string, object?>(), $"FailureType={error}", now);
+        }
+    }
+
+    public void AddLog(Guid id, string level, string message, IReadOnlyDictionary<string, object?> data) {
+        lock (_gate) {
+            if (!_jobs.TryGetValue(id, out var entry)) return;
+            entry.Logs.Add(new JobLogEntry(DateTimeOffset.UtcNow, level, message, data));
+        }
+    }
+
+    public AnalysisJobStatus? GetStatus(Guid id) {
+        lock (_gate) {
+            return _jobs.TryGetValue(id, out var entry) ? entry.Status : null;
+        }
+    }
+
+    public IReadOnlyList<JobLogEntry>? GetLogs(Guid id) {
+        lock (_gate) {
+            return _jobs.TryGetValue(id, out var entry) ? entry.Logs.ToArray() : null;
+        }
+    }
+
+    public AnalysisJobResult? GetResult(Guid id) {
+        lock (_gate) {
+            return _jobs.TryGetValue(id, out var entry) ? entry.Result : null;
+        }
+    }
+
+    private sealed class ProgressSink(Action<JobProgressUpdate> report) : IJobProgressSink {
+        public void Report(JobProgressUpdate update) => report(update);
+    }
+
+    private sealed class JobEntry(
+        AnalysisJobRequest request,
+        CancellationTokenSource cancellation,
+        AnalysisJobStatus status) {
+
+        public AnalysisJobRequest Request { get; } = request;
+        public CancellationTokenSource Cancellation { get; } = cancellation;
+        public AnalysisJobStatus Status { get; set; } = status;
+        public AnalysisJobResult? Result { get; set; }
+        public List<JobLogEntry> Logs { get; } = [];
+    }
 }
