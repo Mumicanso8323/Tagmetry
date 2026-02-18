@@ -1,0 +1,6 @@
+Component: Microsoft.Extensions.Logging
+Version: 10.0.3
+Source: NuGet
+License: SPDX: MIT
+License URL: https://licenses.nuget.org/MIT
+Homepage: https://dot.net/

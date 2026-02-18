@@ -17,7 +17,7 @@ void BootstrapLog(string message, Exception? ex = null)
     try
     {
         var line = $"{DateTimeOffset.Now:O} {message}";
-        if (ex is not null) line += Environment.NewLine + ex;
+        if (ex is not null) line += Environment.NewLine + $"ExceptionType={ex.GetType().Name}";
         File.AppendAllText(bootstrapPath, line + Environment.NewLine);
     }
     catch { }
@@ -112,7 +112,7 @@ try
     {
         await joy.StartAsync(thirdPartyDir, opt, CancellationToken.None);
 
-        logger.LogInformation("Stub run: input={Input}", inputDir);
+        logger.LogInformation("Stub run started.");
         Console.WriteLine("OK (stub).");
         return 0;
     }
@@ -120,7 +120,7 @@ try
     {
         logger.LogError(ex, "Failed");
         BootstrapLog("[ERROR] App run failed.", ex);
-        Console.Error.WriteLine(ex);
+        Console.Error.WriteLine($"Error: {ex.GetType().Name}");
         return 1;
     }
     finally
